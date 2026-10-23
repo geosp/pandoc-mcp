@@ -1,0 +1,17 @@
+services:
+  pandoc-mcp:
+    build: .
+    image: pandoc-mcp:latest
+    environment:
+      PANDOC_MCP_TOKEN: ${PANDOC_MCP_TOKEN:?set PANDOC_MCP_TOKEN in .env}
+      PANDOC_MCP_PUBLIC_BASE_URL: ${PANDOC_MCP_PUBLIC_BASE_URL:-http://localhost:8301}
+      PANDOC_MCP_RETENTION_DAYS: ${PANDOC_MCP_RETENTION_DAYS:-7}
+    ports:
+      - "${PANDOC_MCP_PORT:-8301}:8301"
+    volumes:
+      - documents:/data/documents
+      - ./assets:/app/assets:ro
+    restart: unless-stopped
+
+volumes:
+  documents:

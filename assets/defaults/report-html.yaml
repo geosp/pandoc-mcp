@@ -1,0 +1,7 @@
+# Standalone HTML report: numbered sections, table of contents, readable line width
+standalone: true
+number-sections: true
+toc: true
+toc-depth: 2
+variables:
+  maxwidth: 48em

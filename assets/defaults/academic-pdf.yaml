@@ -1,0 +1,11 @@
+# Academic paper PDF: numbered sections, table of contents, 11pt article layout
+pdf-engine: xelatex
+number-sections: true
+toc: true
+toc-depth: 3
+variables:
+  documentclass: article
+  fontsize: 11pt
+  geometry:
+    - margin=1in
+  linkcolor: blue
