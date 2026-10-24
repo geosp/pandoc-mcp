@@ -24,7 +24,7 @@ flowchart LR
     end
 
     llm -- "MCP over HTTP /mcp<br/>bearer token" --> server
-    browser -- "POST /upload (token)<br/>GET /documents/{id}/{name}" --> server
+    browser -- "POST /upload/{link token}<br/>GET /documents/{id}/{name}" --> server
     server -- "subprocess" --> pandoc
     pandoc -- "PDF output" --> tex
     pandoc -- "mermaid.lua filter" --> mmdc
@@ -47,7 +47,7 @@ config. Only the outer layer imports MCP.
 flowchart TB
     subgraph mcp_layer["MCP layer"]
         server["server.py<br/>PandocMCPServer: instructions, auth, main()"]
-        service["service.py<br/>PandocMCPService: tool discovery, /upload, /documents"]
+        service["service.py<br/>PandocMCPService: tool discovery, /upload/{token}, /documents"]
         tools["features/*/tool.py<br/>one tool per folder"]
         results["results.py<br/>ToolError mapping, inline content"]
     end
@@ -57,12 +57,13 @@ flowchart TB
         runner["runner.py<br/>PandocRunner: subprocess, timeout, format tables"]
         docs["documents.py<br/>DocumentStore"]
         assets["assets.py<br/>AssetLibrary"]
-        lua["filters/mermaid.lua"]
+        uploads["uploads.py<br/>UploadLinks"]
+        lua["filters/*.lua<br/>mermaid, resources"]
     end
 
     server --> service --> tools --> ps
     tools --> results
-    ps --> runner & docs & assets
+    ps --> runner & docs & assets & uploads
     runner -. "--lua-filter" .-> lua
 ```
 
@@ -73,6 +74,7 @@ flowchart TB
 | `runner.py` | Starts pandoc, applies the timeout, maps a failure to `ConversionError`; format → extension/MIME tables |
 | `documents.py` | Id-based file store with metadata and retention purge |
 | `assets.py` | Resolves admin-installed assets **by name** |
+| `uploads.py` | Short-lived upload links: hashed tokens, file limits, `upload_id` grants |
 | `results.py` | Turns results and errors into MCP content |
 
 ## A conversion, step by step
@@ -113,6 +115,34 @@ Points worth knowing:
   the defaults file. A defaults file cannot change the target format or the output path.
 - **Formats come from pandoc.** They are read at startup (`--list-input/output-formats`), not
   from a hard-coded list.
+- **Images come only from `resources`.** The listed documents are copied into
+  `<workdir>/resources/`, and `filters/resources.lua` embeds matching images: a data URI for
+  HTML, the media bag otherwise. Every other image path stays blocked by the sandbox.
+
+## Uploads
+
+```mermaid
+sequenceDiagram
+    participant L as LLM (MCP client)
+    participant S as pandoc-mcp
+    participant U as User browser / agent shell
+
+    L->>S: create_upload_link(max_files) over /mcp (bearer token)
+    S-->>L: /upload/<token> URL + upload_id
+    L->>U: share the link (or run curl)
+    U->>S: POST /upload/<token> (files)
+    S-->>U: names, sizes, remaining (no ids)
+    L->>S: check_upload(upload_id, wait_s)
+    S-->>L: document ids → document / resources
+```
+
+The link is the only upload credential: `token_urlsafe(32)`, kept as a sha256 hash in memory.
+It is upload-only, expires after `UPLOAD_LINK_TTL_S`, and closes after `max_files`. It is not
+tied to an MCP session, because on protocol 2026-07-28 FastMCP's `session_id` changes with
+every request. Instead the non-secret `upload_id`, which only the MCP caller receives, is the
+handle for the results. The link will show up in transcripts; that is acceptable because it
+is useless once spent or expired. A restart closes all links. Over stdio there are no links;
+`input_path` is used instead.
 
 ## Storage
 
@@ -122,7 +152,7 @@ Points worth knowing:
 ```
 
 The random id is the access control for downloads: `GET /documents/<id>/<filename>` needs no
-token, so treat links like shared secrets. Uploads require the bearer token. Documents older
+token, so treat links like shared secrets. Uploads need a link (see above). Documents older
 than `RETENTION_DAYS` are purged at most once an hour, during a conversion.
 
 ## Assets
@@ -159,7 +189,9 @@ attack that was tested:
 | Client-chosen filter, defaults file or template path runs code | Assets by name only; no chmod |
 | Path traversal in upload names or output files | `safe_filename`, no `output_path` over HTTP |
 | Runaway conversion | Subprocess timeout, then kill; input size limit |
-| Unauthenticated use | Bearer token on `/mcp` and `/upload` (`BearerTokenVerifier`) |
+| Unauthenticated use | Bearer token on `/mcp` (`BearerTokenVerifier`) |
+| Server token handed to users or shells to upload | Upload links: upload-only, minutes, N files, hashed |
+| Image reference used to read arbitrary files | Only listed `resources` are readable, by file name |
 
 These are accepted risks. Filters in `assets/` are trusted code. Chromium runs mermaid without
 its own sandbox, but inside the container, with mermaid's `strict` security level.

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>pandoc-mcp upload</title>
 <style>
   :root { color-scheme: light dark; --accent: #2f6fde; --muted: #8a8f98; --border: #8a8f9855; }
@@ -10,8 +11,6 @@
   h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
   p.hint { color: var(--muted); margin-top: 0; }
   label { display: block; font-weight: 600; margin: 1rem 0 0.3rem; }
-  input[type=password] { width: 100%; box-sizing: border-box; padding: 0.5rem; font: inherit;
-    border: 1px solid var(--border); border-radius: 6px; background: transparent; color: inherit; }
   #drop { border: 2px dashed var(--border); border-radius: 10px; padding: 2rem 1rem;
     text-align: center; cursor: pointer; margin-top: 1rem; }
   #drop.over { border-color: var(--accent); }
@@ -20,35 +19,24 @@
   .result { display: flex; gap: 1rem; align-items: center; border: 1px solid var(--border);
     border-radius: 10px; padding: 0.75rem; margin-top: 0.75rem; }
   .result code { font-size: 0.85rem; word-break: break-all; }
-  button { font: inherit; padding: 0.3rem 0.8rem; border-radius: 6px; border: 1px solid var(--border);
-    background: transparent; color: inherit; cursor: pointer; margin-top: 0.4rem; }
 </style>
 </head>
 <body>
-<h1>Upload a document</h1>
-<p class="hint">Give the returned id to the assistant: it works as <code>document</code> in
-<code>convert_document</code> and <code>get_document</code>.</p>
+<h1>Upload files</h1>
+<p class="hint">This link was created by your assistant. It works for a few minutes and a
+limited number of files. When you're done, tell the assistant.</p>
 
-<label for="token">Bearer token (PANDOC_MCP_TOKEN)</label>
-<input id="token" type="password" autocomplete="off" placeholder="Kept for this browser tab only">
-
-<div id="drop">Drop documents here, or click to choose
+<div id="drop">Drop files here, or click to choose
   <input id="file" type="file" multiple hidden>
 </div>
 <div id="status"></div>
 <div id="results"></div>
 
 <script>
-const token = document.getElementById("token");
 const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
 const statusEl = document.getElementById("status");
 const results = document.getElementById("results");
-
-try { token.value = sessionStorage.getItem("pandoc-token") || ""; } catch (e) {}
-token.addEventListener("input", () => {
-  try { sessionStorage.setItem("pandoc-token", token.value); } catch (e) {}
-});
 
 drop.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => upload(fileInput.files));
@@ -63,30 +51,26 @@ async function upload(files) {
     statusEl.className = ""; statusEl.textContent = `Uploading ${file.name}…`;
     const body = new FormData(); body.append("file", file);
     try {
-      const response = await fetch("upload", { method: "POST", body,
-        headers: { "Authorization": `Bearer ${token.value.trim()}` } });
+      // The page's own URL carries the upload token
+      const response = await fetch(location.pathname, { method: "POST", body });
       const data = await response.json().catch(() => ({ error: response.statusText }));
       if (!response.ok) throw new Error(data.error || response.statusText);
-      statusEl.textContent = "";
-      show(file.name, data);
+      data.files.forEach(show);
+      statusEl.textContent = data.remaining > 0
+        ? `Done. This link accepts ${data.remaining} more file(s).`
+        : "Done. This link is now used up; tell the assistant you're finished.";
     } catch (err) {
       statusEl.className = "error"; statusEl.textContent = `${file.name}: ${err.message}`;
     }
   }
 }
 
-function show(name, data) {
+function show(file) {
   const row = document.createElement("div"); row.className = "result";
-  const info = document.createElement("div");
-  const id = document.createElement("code"); id.textContent = data.id;
-  const meta = document.createElement("div"); meta.className = "hint";
-  meta.textContent = `${data.filename} · ${data.size} bytes`;
-  const copy = document.createElement("button"); copy.textContent = "Copy id";
-  copy.onclick = async () => {
-    try { await navigator.clipboard.writeText(data.id); copy.textContent = "Copied"; }
-    catch (e) { copy.textContent = "Select and copy the id"; }
-  };
-  info.append(id, meta, copy); row.append(info); results.prepend(row);
+  const name = document.createElement("code"); name.textContent = file.filename;
+  const meta = document.createElement("span"); meta.className = "hint";
+  meta.textContent = `${file.size} bytes`;
+  row.append(name, meta); results.prepend(row);
 }
 </script>
 </body>

@@ -27,6 +27,7 @@ from .runner import (
     extension_for,
     is_binary,
 )
+from .uploads import UploadLinks
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ LATEX_ENGINES = {"xelatex", "pdflatex", "lualatex", "latexmk", "tectonic"}
 REFERENCE_DOC_FORMATS = {"docx", "odt", "pptx"}
 PURGE_INTERVAL_S = 3600
 MERMAID_FILTER = Path(__file__).parent / "filters" / "mermaid.lua"
+RESOURCES_FILTER = Path(__file__).parent / "filters" / "resources.lua"
+MAX_RESOURCES = 20
 MERMAID_FENCE = re.compile(rb"^\s*(```|~~~)\s*\{?\s*\.?mermaid\b", re.MULTILINE)
 
 
@@ -73,6 +76,8 @@ class PandocService:
         self._last_purge = 0.0
         self.mermaid_env: dict[str, str] | None = None
         """Environment for the mermaid filter; None when mermaid rendering is unavailable"""
+        self.uploads: UploadLinks | None = None
+        """Upload links; set by the MCP service"""
 
     async def convert(
         self,
@@ -93,9 +98,11 @@ class PandocService:
         metadata: dict[str, str] | None = None,
         table_of_contents: bool = False,
         render_mermaid: bool = True,
+        resources: list[str] | None = None,
     ) -> ConversionResult:
         self._purge_if_due()
         source = self._read_input(contents, contents_base64, document, input_path, filename)
+        extra_files = self._read_resources(resources or [], len(source.data))
         input_format = input_format or source.format
         if not input_format:
             raise ValueError("Cannot tell the input format: pass input_format, or a filename "
@@ -114,6 +121,10 @@ class PandocService:
             input_file.write_bytes(source.data)
             output_file = workdir / "out" / out_name
             output_file.parent.mkdir()
+            resources_dir = workdir / "resources"
+            resources_dir.mkdir()
+            for name, file_data in extra_files.items():
+                (resources_dir / name).write_bytes(file_data)
 
             # Defaults first: later command-line options override the defaults file,
             # so it cannot change the requested formats or output file
@@ -148,12 +159,18 @@ class PandocService:
                 asset = self.assets.resolve("templates", template)
                 args.append(f"--template={asset.path}")
                 used_assets["template"] = asset.name
-            # Before the user's filters, so they see the rendered diagrams
+            # Bundled filters run before the user's, so those see images and diagrams
+            filter_env: dict[str, str] = {}
+            if extra_files:
+                args.append(f"--lua-filter={RESOURCES_FILTER}")
+                filter_env["PANDOC_MCP_RESOURCES_DIR"] = str(resources_dir)
+                used_assets["resources"] = sorted(extra_files)
             mermaid = (render_mermaid and self.mermaid_env is not None
                        and MERMAID_FENCE.search(source.data) is not None)
             if mermaid:
                 args.append(f"--lua-filter={MERMAID_FILTER}")
                 used_assets["mermaid"] = True
+                filter_env.update(self.mermaid_env)
             for name in filters or []:
                 asset = self.assets.resolve("filters", name)
                 flag = "--lua-filter" if asset.path.suffix == ".lua" else "--filter"
@@ -165,8 +182,7 @@ class PandocService:
                 args += ["--metadata", f"{key}={value}"]
 
             args.append(input_file.name)
-            run = await self.runner.run(args, cwd=workdir,
-                                        env=self.mermaid_env if mermaid else None)
+            run = await self.runner.run(args, cwd=workdir, env=filter_env)
             data = output_file.read_bytes()
 
         warnings = [line for line in run.stderr.splitlines() if line.strip()]
@@ -184,10 +200,31 @@ class PandocService:
         saved_to = self._write_local(output_path, data) if output_path else None
         return ConversionResult(stored, data, output_format, warnings, saved_to)
 
-    def store_upload(self, data: bytes, filename: str) -> StoredDocument:
+    def store_upload(self, data: bytes, filename: str, upload_id: str) -> StoredDocument:
         name = safe_filename(filename)
         guessed = INPUT_BY_EXTENSION.get(Path(name).suffix.removeprefix(".").lower())
-        return self.store.save(data, name, {"tool": "upload", "format": guessed})
+        return self.store.save(data, name, {"tool": "upload", "format": guessed,
+                                            "upload_id": upload_id})
+
+    def _read_resources(self, refs: list[str], input_size: int) -> dict[str, bytes]:
+        """Stored documents to place next to the input, by file name"""
+        if len(refs) > MAX_RESOURCES:
+            raise ValueError(f"At most {MAX_RESOURCES} resources per conversion")
+        files: dict[str, bytes] = {}
+        total = input_size
+        for ref in refs:
+            stored = self.store.get(_document_id(ref))
+            if stored is None:
+                raise ValueError(f"No stored document '{ref}' to use as a resource")
+            if stored.filename in files:
+                raise ValueError(f"Two resources are named '{stored.filename}'; "
+                                 "upload one under a different name")
+            total += stored.size
+            if total > self.config.max_input_bytes:
+                raise ValueError(f"Input and resources together are larger than "
+                                 f"{self.config.max_input_bytes} bytes")
+            files[stored.filename] = stored.path.read_bytes()
+        return files
 
     def get_document(self, document: str | None) -> tuple[StoredDocument, dict[str, Any], bytes]:
         if document:

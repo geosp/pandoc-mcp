@@ -16,9 +16,11 @@ For how it is built (layers, conversion flow, storage, security model), see
 
 | Tool | What it does |
 | --- | --- |
-| `convert_document` | Convert one input to `output_format`. Input is exactly one of `contents` (text), `contents_base64` (a binary file), `document` (id of a stored document) or `input_path` (local stdio only). Options: `input_format`, `filename`, `standalone`, `table_of_contents`, `metadata`, and the named assets `defaults`, `reference_doc`, `template`, `filters`. |
+| `convert_document` | Convert one input to `output_format`. Input is exactly one of `contents` (text), `contents_base64` (a binary file), `document` (id of a stored document) or `input_path` (local stdio only). Options: `input_format`, `filename`, `standalone`, `table_of_contents`, `metadata`, `resources` (ids of uploaded images the input refers to by file name), and the named assets `defaults`, `reference_doc`, `template`, `filters`. |
 | `get_document` | Fetch a stored document (the latest if no id) with its metadata and content. |
 | `list_assets` | List the server's named filters, defaults files, reference docs and templates, plus the pandoc version. |
+| `create_upload_link` | HTTP only. Return a short-lived, upload-only link for files the model can't pass inline, plus an `upload_id`. |
+| `check_upload` | List the files uploaded through a link, as document ids for `document` or `resources`. With `wait_s` it waits for them. |
 
 Each result is stored on the server and returned with an **id** and a **download URL**:
 
@@ -28,6 +30,27 @@ Each result is stored on the server and returned with an **id** and a **download
 - `inline: false` returns only the id and URL, which keeps large files out of the model's context.
 
 The id can be passed as `document` to chain conversions, e.g. DOCX → markdown, edit, markdown → DOCX, without resending the bytes.
+
+### Uploads and images
+
+To get a file the model can't pass inline, such as the user's own files or files on an agent's
+shell, the model calls `create_upload_link`. The link:
+
+- works only for uploading, with no access to anything else;
+- expires after `PANDOC_MCP_UPLOAD_LINK_TTL_S` (10 minutes);
+- stops working once it has accepted `max_files` files.
+
+The user opens it in a browser, or the agent runs the `curl -F file=@...` command it shows.
+The model then calls `check_upload(upload_id)` to get the document ids. The uploader never
+sees the ids, and nobody needs the server's token.
+
+Images are embedded by passing their ids as `resources` and referring to them by file name:
+
+```json
+{"contents": "# Report\n\n![Sales](chart.png)", "output_format": "docx", "resources": ["<id>"]}
+```
+
+Only those files are readable; any other image path stays blocked by the sandbox.
 
 ## Mermaid diagrams
 
@@ -87,9 +110,8 @@ claude mcp add --transport http pandoc http://localhost:8301/mcp \
 The server also provides these routes:
 
 - `GET /documents/<id>/<filename>`: download a stored document. The id is a random uuid4.
-- `POST /upload` (multipart field `file`, bearer token required) returns `{"id", "url", ...}`. Use it
-  for files the model cannot see: `curl -H "Authorization: Bearer $PANDOC_MCP_TOKEN" -F file=@report.docx http://localhost:8301/upload`.
-- `GET /upload`: a browser form for the same.
+- `GET /upload/<token>` / `POST /upload/<token>`: the upload form and endpoint behind a link from
+  `create_upload_link`. The link is the credential; there is no other way to upload.
 
 ## Assets
 
@@ -132,6 +154,9 @@ If a text asset's first line is a comment (`#`, `--` or `%`), that line becomes 
 | `PANDOC_MCP_MMDC_PATH` | `mmdc` | mermaid-cli executable |
 | `PANDOC_MCP_MERMAID_THEME` | `default` | `default`, `neutral`, `dark` or `forest` |
 | `PANDOC_MCP_PUPPETEER_CONFIG` | (`/etc/puppeteer.json` in Docker) | Chromium settings for mmdc |
+| `PANDOC_MCP_UPLOAD_LINK_TTL_S` | 600 | Lifetime of an upload link |
+| `PANDOC_MCP_UPLOAD_LINK_MAX_FILES` | 10 | Most files one link may accept |
+| `PANDOC_MCP_UPLOAD_LINK_MAX_ACTIVE` | 100 | Most links open at once |
 | `PANDOC_MCP_ALLOW_LOCAL_PATHS` | stdio only | Accept `input_path` / `output_path` |
 
 ## Security model
@@ -142,9 +167,13 @@ These protections apply over HTTP:
   - `input_path` and `output_path` are disabled.
   - Assets are resolved by bare name inside the assets directory.
   - Upload filenames are reduced to a plain name.
+- **The server token never leaves the MCP client.** Uploads use links that are upload-only,
+  short-lived and limited to a few files. Tokens are stored only as hashes, in memory, so a
+  restart invalidates them. A link that ends up in a transcript stops working once it is used up
+  or expires.
 - **Pandoc runs with `--sandbox`.** Readers and writers cannot read local files. For example,
   `![x](/etc/passwd)` → DOCX would otherwise embed the file. Each conversion also runs in its
-  own temporary directory.
+  own temporary directory. Images are embedded only when they are listed as `resources`.
 - **TeX is confined.** It runs with `openin_any=p openout_any=p shell_escape=f`, so raw LaTeX
   such as `\input{/etc/passwd}` is refused by xelatex.
 - **Arguments go straight to pandoc.** It is run as a subprocess with an argument list, never a

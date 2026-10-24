@@ -8,6 +8,7 @@ from pandoc_mcp.assets import AssetLibrary
 from pandoc_mcp.documents import DocumentStore, safe_filename
 from pandoc_mcp.results import tool_errors
 from pandoc_mcp.runner import ConversionError, base_format, extension_for, is_binary, mime_type_for
+from pandoc_mcp.uploads import UploadLinks
 
 from .conftest import ASSETS_DIR
 
@@ -83,3 +84,27 @@ def test_conversion_error_hints(stderr, hint):
         assert hint in message
     else:
         assert message == f"Pandoc failed: {stderr}"
+
+
+def test_upload_links():
+    now = [0.0]
+    links = UploadLinks(ttl_s=600, max_links=2, clock=lambda: now[0])
+    token, grant = links.create(max_files=2)
+    assert token not in links._by_token and links.for_token(token) is grant
+    assert links.for_token(token + "x") is None
+
+    links.record(grant, "a" * 32)
+    links.record(grant, "b" * 32)
+    assert links.for_token(token) is None  # used up
+    assert links.get(grant.upload_id).files == ["a" * 32, "b" * 32]
+
+    links.create(max_files=1)
+    with pytest.raises(ValueError, match="Too many open upload links"):
+        links.create(max_files=1)
+
+    now[0] = 601  # expired: links close, grants stay readable for a day
+    other, _ = links.create(max_files=1)
+    assert links.for_token(other) is not None and links.expired(grant)
+    assert links.get(grant.upload_id) is grant
+    now[0] = 601 + 24 * 3600
+    assert links.get(grant.upload_id) is None

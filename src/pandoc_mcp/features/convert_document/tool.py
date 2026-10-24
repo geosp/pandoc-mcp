@@ -81,6 +81,11 @@ def register_tool(mcp: FastMCP, pandoc: PandocService) -> None:
             Field(description="Document metadata, e.g. {\"title\": \"Q4 Report\", "
                               "\"author\": \"Ana\", \"lang\": \"en\"}"),
         ] = None,
+        resources: Annotated[
+            list[str] | None,
+            Field(description="Ids of stored documents (e.g. images from check_upload) the "
+                              "input refers to by file name: ![chart](chart.png)"),
+        ] = None,
         render_mermaid: Annotated[
             bool,
             Field(description="Render ```mermaid code blocks as diagrams (kept as code in "
@@ -118,6 +123,7 @@ def register_tool(mcp: FastMCP, pandoc: PandocService) -> None:
                 metadata=metadata,
                 table_of_contents=table_of_contents,
                 render_mermaid=render_mermaid,
+                resources=resources,
             )
         doc = result.document
         summary = [f"Converted to {result.output_format}: {doc.filename} ({doc.size} bytes), "

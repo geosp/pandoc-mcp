@@ -1,6 +1,9 @@
 import base64
+import contextlib
 import io
+import struct
 import zipfile
+import zlib
 
 import httpx
 import pytest
@@ -32,6 +35,10 @@ def server(app_config):
     return server
 
 
+def blob(result) -> bytes:
+    return base64.b64decode(result.content[1].resource.blob)
+
+
 def docx_text(data: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         return z.read("word/document.xml").decode()
@@ -40,7 +47,8 @@ def docx_text(data: bytes) -> str:
 async def test_tools_and_instructions(server):
     async with Client(server.create_mcp_app()) as client:
         names = {t.name for t in await client.list_tools()}
-        assert names == {"convert_document", "get_document", "list_assets"}
+        assert names == {"convert_document", "get_document", "list_assets", "check_upload",
+                         "create_upload_link"}
         assert "contents_base64" in client.instructions
 
 
@@ -164,26 +172,118 @@ async def test_markdown_to_pdf(server):
     assert base64.b64decode(result.content[1].resource.blob)[:4] == b"%PDF"
 
 
-async def test_http_auth_and_upload(app_config):
+def png_bytes() -> bytes:
+    """A 2x2 red PNG, built without image libraries"""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * 2 for _ in range(2))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+@contextlib.asynccontextmanager
+async def http_server(app_config, **config):
+    """An HTTP-mode server with an MCP client and a plain HTTP client on its ASGI app"""
+    for key, value in config.items():
+        setattr(app_config.pandoc, key, value)
     server = make_server(app_config, mode="http", token="secret")
     app = server.create_asgi_app()
-    transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app), httpx.AsyncClient(
-        transport=transport, base_url="http://pandoc.test"
+        transport=httpx.ASGITransport(app=app), base_url="http://pandoc.test:8301"
     ) as http:
-        denied = await http.post("/mcp", json={})
-        assert denied.status_code == 401
-        assert (await http.post("/upload", files={"file": ("a.md", b"# Hi")})).status_code == 401
+        yield server, Client(server._mcp_app), http
 
-        uploaded = await http.post("/upload", files={"file": ("../notes.md", MARKDOWN.encode())},
+
+async def test_http_requires_token(app_config):
+    async with http_server(app_config) as (_, _, http):
+        assert (await http.post("/mcp", json={})).status_code == 401
+        # the old master-token upload route is gone
+        response = await http.post("/upload", files={"file": ("a.md", b"# Hi")},
                                    headers={"Authorization": "Bearer secret"})
-        assert uploaded.status_code == 200
-        body = uploaded.json()
-        assert body["filename"] == "notes.md"
+        assert response.status_code == 404
 
-        download = await http.get(body["url"].removeprefix("http://pandoc.test:8301"))
-        assert download.status_code == 200 and download.text == MARKDOWN
-        assert (await http.get(f"/documents/{body['id']}/other.md")).status_code == 404
 
-    result = await server.service.pandoc.convert("html", document=body["id"], standalone=False)
-    assert "<em>emphasis</em>" in result.text
+async def test_upload_link_flow(app_config):
+    async with http_server(app_config) as (server, client, http):
+        async with client:
+            link = (await client.call_tool("create_upload_link", {"max_files": 2}))
+            url, upload_id = link.structured_content["upload_url"], link.structured_content["upload_id"]
+            assert url.startswith("http://pandoc.test:8301/upload/") and upload_id not in url
+
+            empty = await client.call_tool("check_upload", {"upload_id": upload_id})
+            assert empty.structured_content == {"files": [], "remaining": 2, "expired": False}
+
+            assert (await http.get(url)).status_code == 200
+            uploaded = await http.post(url, files=[("file", ("../notes.md", MARKDOWN.encode())),
+                                                   ("file", ("chart.png", png_bytes()))])
+            assert uploaded.status_code == 200
+            assert uploaded.json()["remaining"] == 0
+            assert "id" not in uploaded.json()["files"][0]
+
+            # used up: the link no longer works, even for its form
+            assert (await http.post(url, files={"file": ("x.md", b"x")})).status_code == 404
+            assert (await http.get(url)).status_code == 404
+
+            checked = await client.call_tool("check_upload", {"upload_id": upload_id})
+            files = {f["filename"]: f for f in checked.structured_content["files"]}
+            assert set(files) == {"notes.md", "chart.png"}
+
+            converted = await client.call_tool("convert_document", {
+                "contents": "# Report\n\n![Chart](chart.png)\n", "output_format": "docx",
+                "resources": [files["chart.png"]["id"]]})
+            with zipfile.ZipFile(io.BytesIO(blob(converted))) as z:
+                assert any(n.startswith("word/media/") for n in z.namelist())
+
+            download = await http.get(files["notes.md"]["url"].removeprefix("http://pandoc.test:8301"))
+            assert download.text == MARKDOWN
+
+
+async def test_upload_link_expires_and_limits(app_config):
+    async with http_server(app_config, upload_link_max_files=3) as (server, client, http):
+        async with client:
+            with pytest.raises(ToolError, match="at most 3"):
+                await client.call_tool("create_upload_link", {"max_files": 4})
+            link = await client.call_tool("create_upload_link", {"max_files": 1})
+            url = link.structured_content["upload_url"]
+            too_many = await http.post(url, files=[("file", ("a.md", b"a")), ("file", ("b.md", b"b"))])
+            assert too_many.status_code == 400
+            assert (await http.post(url + "x", files={"file": ("a.md", b"a")})).status_code == 404
+
+            server.service.pandoc.uploads.clock = lambda: float("inf")
+            assert (await http.post(url, files={"file": ("a.md", b"a")})).status_code == 404
+
+
+async def test_upload_link_needs_http(server):
+    async with Client(server.create_mcp_app()) as client:
+        with pytest.raises(ToolError, match="input_path instead"):
+            await client.call_tool("create_upload_link", {})
+
+
+@pytest.mark.parametrize("sandbox", [False, True])
+@pytest.mark.parametrize("output_format, embedded", [
+    ("html", "data:image/png;base64,"),
+    ("docx", "word/media/"),
+])
+async def test_resources_embed_images(server, sandbox, output_format, embedded):
+    server.service.pandoc.sandbox = sandbox
+    image = server.service.pandoc.store.save(png_bytes(), "chart.png")
+    async with Client(server.create_mcp_app()) as client:
+        result = await client.call_tool("convert_document", {
+            "contents": "![Chart](./chart.png)\n", "output_format": output_format,
+            "resources": [image.url]})
+    if output_format == "html":
+        assert embedded in result.content[1].text
+    else:
+        with zipfile.ZipFile(io.BytesIO(blob(result))) as z:
+            assert any(n.startswith(embedded) for n in z.namelist())
+    assert result.structured_content["warnings"] == []
+
+
+async def test_resources_reject_duplicates(server):
+    store = server.service.pandoc.store
+    first, second = store.save(png_bytes(), "chart.png"), store.save(png_bytes(), "chart.png")
+    async with Client(server.create_mcp_app()) as client:
+        with pytest.raises(ToolError, match="Two resources are named 'chart.png'"):
+            await client.call_tool("convert_document", {
+                "contents": "x", "output_format": "html", "resources": [first.id, second.id]})

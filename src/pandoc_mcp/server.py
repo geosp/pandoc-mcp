@@ -41,10 +41,14 @@ epub, pptx, latex, rst, typst, asciidoc, ipynb and more).
   lists the mermaid error under warnings: fix the diagram and convert again.
 - Styling: list_assets shows the server's named reference documents (docx/odt/pptx styles),
   defaults files, templates and filters. Pass their names, not paths.
-- For a file the user has but you cannot see, ask them to upload it: open <server>/upload in a
-  browser, or
-  curl -H "Authorization: Bearer $PANDOC_MCP_TOKEN" -F file=@report.docx <server>/upload
-  and pass the returned id as document. get_document fetches any stored document again.
+- Images: upload them (see below) and pass their ids as resources; reference them by file
+  name in the markdown, e.g. ![Sales](chart.png). Other image paths are not readable.
+- Files you cannot pass inline (the user's own files, or files on your shell's filesystem):
+  call create_upload_link, then either give the link to the user to open in a browser, or run
+  the curl command it shows. Then call check_upload(upload_id, wait_s=60) to get the document
+  ids for document or resources. Links are upload-only, expire in minutes and accept a
+  limited number of files; never ask the user for the server's token.
+- get_document fetches any stored document again.
 """
 
 

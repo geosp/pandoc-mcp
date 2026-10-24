@@ -3,8 +3,8 @@ MCP service for pandoc-mcp
 
 Builds the pandoc runner, document store and asset library, registers the
 tools from features/*/tool.py, serves stored documents at
-/documents/<id>/<filename> and accepts uploads at /upload (POST, or GET for a
-browser form).
+/documents/<id>/<filename> and accepts uploads through short-lived links at
+/upload/<token> (POST, or GET for a browser form).
 """
 
 import importlib
@@ -25,13 +25,21 @@ from starlette.responses import (
 )
 
 from .assets import AssetLibrary
-from .auth import bearer_token, token_matches
 from .config import AppConfig
 from .documents import DocumentStore
 from .pandoc_service import PandocService
 from .runner import PandocRunner
+from .uploads import UploadLinks
 
 logger = logging.getLogger(__name__)
+
+LINK_GONE_PAGE = (
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+    "<title>Upload link expired</title><body style='font:15px system-ui;max-width:640px;"
+    "margin:2rem auto;padding:0 16px'><h1>This upload link is invalid or expired</h1>"
+    "<p>Links work for a few minutes and a limited number of files. "
+    "Ask the assistant for a new one.</p>"
+)
 
 
 class PandocMCPService(BaseService):
@@ -58,6 +66,9 @@ class PandocMCPService(BaseService):
             local_paths=local_paths, sandbox=not local_paths,
         )
         self.pandoc.mermaid_env = self._mermaid_env()
+        if self.config.server.transport == "http":  # links need the HTTP routes
+            self.pandoc.uploads = UploadLinks(pandoc_config.upload_link_ttl_s,
+                                              pandoc_config.upload_link_max_active)
         logger.info(f"Using pandoc {info.version}; local paths "
                     f"{'allowed' if local_paths else 'disabled'}; mermaid "
                     f"{'enabled' if self.pandoc.mermaid_env else 'disabled'}")
@@ -90,8 +101,6 @@ class PandocMCPService(BaseService):
             logger.info(f"Registered tool from feature: {feature_name}")
 
         pandoc = self.pandoc
-        max_bytes = self.config.pandoc.max_input_bytes
-        upload_page = (Path(__file__).parent / "upload_page.html").read_text()
 
         @mcp.custom_route("/documents/{doc_id}/{filename}", methods=["GET"],
                           include_in_schema=False)
@@ -103,38 +112,53 @@ class PandocMCPService(BaseService):
             document = pandoc.store.get(request.path_params["doc_id"])
             return FileResponse(path, media_type=document.mime_type, filename=path.name)
 
-        @mcp.custom_route("/upload", methods=["GET"], include_in_schema=False)
+        if pandoc.uploads is not None:
+            self._register_upload_routes(mcp)
+
+    def _register_upload_routes(self, mcp: FastMCP) -> None:
+        pandoc = self.pandoc
+        max_bytes = self.config.pandoc.max_input_bytes
+        upload_page = (Path(__file__).parent / "upload_page.html").read_text()
+
+        @mcp.custom_route("/upload/{token}", methods=["GET"], include_in_schema=False)
         async def upload_form(request: Request) -> Response:
+            if pandoc.uploads.for_token(request.path_params["token"]) is None:
+                return HTMLResponse(LINK_GONE_PAGE, status_code=404)
             return HTMLResponse(upload_page)
 
-        @mcp.custom_route("/upload", methods=["POST"], include_in_schema=False)
+        @mcp.custom_route("/upload/{token}", methods=["POST"], include_in_schema=False)
         async def upload(request: Request) -> Response:
-            # FastMCP's auth covers /mcp only, so custom routes check the token themselves
-            if not self._authorized(request):
-                return JSONResponse({"error": "missing or invalid bearer token"}, status_code=401,
-                                    headers={"WWW-Authenticate": "Bearer"})
-            too_large = JSONResponse({"error": f"file is larger than {max_bytes} bytes"},
+            # The link itself is the credential: no Authorization header
+            grant = pandoc.uploads.for_token(request.path_params["token"])
+            if grant is None:
+                return JSONResponse({"error": "this upload link is invalid, expired or used up"},
+                                    status_code=404)
+            too_large = JSONResponse({"error": f"each file must be at most {max_bytes} bytes"},
                                      status_code=413)
-            if int(request.headers.get("content-length") or 0) > max_bytes + 64 * 1024:
+            if int(request.headers.get("content-length") or 0) > \
+                    grant.remaining * max_bytes + 64 * 1024:
                 return too_large
-            async with request.form(max_files=1, max_fields=0) as form:
-                file = form.get("file")
-                if file is None or isinstance(file, str):
-                    return JSONResponse({"error": "send the document as multipart field 'file'"},
-                                        status_code=400)
-                if file.size is not None and file.size > max_bytes:
-                    return too_large
-                data = await file.read()
-            if not data:
-                return JSONResponse({"error": "the file is empty"}, status_code=400)
-            stored = pandoc.store_upload(data, file.filename or "upload")
-            logger.info(f"Stored upload {stored.id} ({stored.filename}, {stored.size} bytes)")
-            return JSONResponse({"id": stored.id, "url": stored.url,
-                                 "filename": stored.filename, "size": stored.size})
-
-    def _authorized(self, request: Request) -> bool:
-        server, token = self.config.server, self.config.pandoc.token
-        if not (server.transport == "http" and server.auth_enabled):
-            return True
-        given = bearer_token(request.headers.get("authorization"))
-        return token is not None and given is not None and token_matches(token, given)
+            files: list[tuple[str, bytes]] = []
+            async with request.form(max_files=grant.remaining, max_fields=0) as form:
+                for file in form.getlist("file"):
+                    if isinstance(file, str):
+                        continue
+                    if file.size is not None and file.size > max_bytes:
+                        return too_large
+                    files.append((file.filename or "upload", await file.read()))
+            if not files:
+                return JSONResponse({"error": "send the files as multipart field 'file'"},
+                                    status_code=400)
+            if any(not data for _, data in files):
+                return JSONResponse({"error": "empty files are not accepted"}, status_code=400)
+            if len(files) > grant.remaining:
+                return JSONResponse({"error": f"this link accepts {grant.remaining} more file(s)"},
+                                    status_code=400)
+            stored = []
+            for filename, data in files:
+                document = pandoc.store_upload(data, filename, grant.upload_id)
+                pandoc.uploads.record(grant, document.id)
+                stored.append({"filename": document.filename, "size": document.size})
+                logger.info(f"Stored upload {document.id} ({document.filename}, "
+                            f"{document.size} bytes) for {grant.upload_id}")
+            return JSONResponse({"files": stored, "remaining": grant.remaining})
